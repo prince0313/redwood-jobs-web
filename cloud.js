@@ -1,14 +1,20 @@
 'use strict';
-/* ================= Cloud: owner ↔ subcontractors, online signing ================= */
-Object.assign(DEFAULTS, {role: '', cloudUrl: '', ownerKey: '', ownerOk: false, ownerEmail: '', subToken: '', subName: '', subBiz: ''});
-let cloud = {subs: [], assigns: [], lastSync: 0, apk: null};
+/* ================= Cloud: team accounts (admin / subcontractor), jobs to subs, online signing ================= */
+Object.assign(DEFAULTS, {role: '', cloudUrl: '', token: '', me: null, mustChange: false, subBiz: '', ownerEmail: ''});
+let cloud = {users: [], subs: [], assigns: [], lastSync: 0, apk: null};
 let subData = {jobs: [], at: 0, seen: {}, drafts: {}};
+let pendingPw = '';
 const NBCB = {};
 window.__nb = (id, ok, text) => { const c = NBCB[id]; if (!c) return; delete NBCB[id]; ok ? c.res(text) : c.rej(new Error(text || 'Network error')); };
-const isOwnerCloud = () => settings.role !== 'sub' && !!settings.cloudUrl && !!settings.ownerKey && !!settings.ownerOk;
+const signedIn = () => !!(settings.cloudUrl && settings.token && settings.me);
+const isAdmin = () => signedIn() && settings.me.role === 'admin';
+const isOwnerCloud = () => settings.role !== 'sub' && isAdmin() && !settings.mustChange;
 const appVersion = () => (NB && NB.version) ? NB.version() : 'web ' + (typeof webBuild === 'function' ? webBuild() : '');
 const saveCloud = () => DB.put('kv', cloud, 'cloud').catch(() => {});
 const saveSub = () => DB.put('kv', subData, 'subdata').catch(() => {});
+const setUsers = list => { cloud.users = list; cloud.subs = list.filter(u => u.role === 'sub'); };
+const normUser = v => String(v || '').trim().toLowerCase().replace(/\s+/g, '.').replace(/[^a-z0-9._@-]/g, '');
+const pwProblem = p => p.length < 8 ? 'Use at least 8 characters' : (!/[a-zA-Z]/.test(p) || !/[0-9]/.test(p)) ? 'Use letters and numbers' : '';
 
 function rawPost(url, body) {
   if (NB && NB.httpPost) {
@@ -22,14 +28,17 @@ function rawPost(url, body) {
 }
 function api(action, data = {}) {
   if (!settings.cloudUrl) return Promise.reject(new Error('Cloud server not connected'));
-  const auth = settings.role === 'sub' ? {token: settings.subToken} : {key: settings.ownerKey};
-  return rawPost(settings.cloudUrl, JSON.stringify(Object.assign({action}, data, auth))).then(t => {
+  return rawPost(settings.cloudUrl, JSON.stringify(Object.assign({action}, data, {token: settings.token}))).then(t => {
     let r; try { r = JSON.parse(t); } catch (e) { throw new Error('The server link did not answer correctly. Check the URL and that the web app access is set to "Anyone".'); }
-    if (!r.ok) throw new Error(r.error || 'Server error');
+    if (!r.ok) {
+      const msg = String(r.error || 'Server error');
+      if (/^AUTH:/.test(msg)) { if (settings.token) { Object.assign(settings, {token: '', mustChange: false}); saveSettings(); setTimeout(() => route(), 60); } throw new Error(msg.replace(/^AUTH:\s*/, '')); }
+      if (/^PWCHANGE:/.test(msg)) { settings.mustChange = true; saveSettings(); setTimeout(() => route(), 60); throw new Error(msg.replace(/^PWCHANGE:\s*/, '')); }
+      throw new Error(msg);
+    }
     return r.data;
   });
 }
-function genKey() { const a = new Uint8Array(24); crypto.getRandomValues(a); return btoa(String.fromCharCode(...a)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, ''); }
 function shareTextVia(target, phone, email, subject, text) {
   if (NB && NB.shareTextTo) return NB.shareTextTo(target, phone || '', email || '', subject || '', text);
   if (typeof webShareText === 'function' && webShareText(target, phone, email, subject, text)) return;
@@ -46,14 +55,17 @@ function cancelLink(id) { if (isOwnerCloud() && id) api('estCancel', {id}).catch
 async function onAppReady() {
   try { const c = await DB.get('kv', 'cloud'); if (c) cloud = Object.assign(cloud, c); } catch (e) {}
   try { const s = await DB.get('kv', 'subdata'); if (s) subData = Object.assign(subData, s); } catch (e) {}
+  if (settings.subToken) { delete settings.subToken; saveSettings(); }
   if (isOwnerCloud()) setTimeout(() => syncCloud(), 800);
 }
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
   if (isOwnerCloud()) syncCloud();
-  else if (settings.role === 'sub' && settings.subToken) subRefresh();
+  else if (settings.role === 'sub' && signedIn() && !settings.mustChange) subRefresh();
 });
 function roleGate(view, id, keep) {
+  if (signedIn() && settings.mustChange) { renderPwChange(); return true; }
+  if (view === 'signin') { renderSignIn(); return true; }
   if (!settings.role) {
     if (jobs.length || settings.lastBackup) { settings.role = 'owner'; saveSettings(); return false; }
     renderWelcome(); return true;
@@ -65,55 +77,148 @@ function renderWelcome() {
   document.body.classList.add('detail');
   $('#top').innerHTML = `<div class="brand"><small>Redwood Jobs</small><b>Welcome</b></div>`;
   main.innerHTML = `${typeof installBanner === 'function' ? installBanner() : ''}<div class="empty" style="padding-top:24px"><div class="big">${icon('fence', 40)}</div><b>How will you use the app?</b>You can change this later.</div>
-    <button class="opt card" style="display:flex;gap:14px;align-items:center;width:100%;text-align:left" data-a="roleowner">${icon('jobs', 28)}<div><b style="font-size:17px">I run the business</b><div class="hint" style="margin:2px 0 0">Track jobs, estimates, payments. Send jobs to subcontractors.</div></div></button>
-    <button class="opt card" style="display:flex;gap:14px;align-items:center;width:100%;text-align:left" data-a="rolesub">${icon('users', 28)}<div><b style="font-size:17px">I'm a subcontractor</b><div class="hint" style="margin:2px 0 0">See jobs sent to you and send your price. You need an invite.</div></div></button>`;
+    <button class="opt card" style="display:flex;gap:14px;align-items:center;width:100%;text-align:left" data-a="signinopen">${icon('users', 28)}<div><b style="font-size:17px">Sign in</b><div class="hint" style="margin:2px 0 0">Subcontractors and team members: use the username and password you were sent.</div></div></button>
+    <button class="opt card" style="display:flex;gap:14px;align-items:center;width:100%;text-align:left" data-a="roleowner">${icon('jobs', 28)}<div><b style="font-size:17px">I run the business</b><div class="hint" style="margin:2px 0 0">Track jobs, estimates and payments. Connect your server later to manage your team.</div></div></button>`;
 }
 ACT.roleowner = () => { settings.role = 'owner'; saveSettings(); location.hash = '#/jobs'; route(); };
-ACT.rolesub = () => { settings.role = 'sub'; saveSettings(); location.hash = '#/jobs'; route(); };
+ACT.signinopen = () => { location.hash = '#/signin'; };
 
-/* ================= OWNER ================= */
-MORE_SECTIONS.unshift(() => {
-  if (!isOwnerCloud()) return `<section class="card"><h3>Cloud &amp; subcontractors</h3>
-    <p class="hint">Send jobs to subcontractors, collect their prices, and let clients sign estimates online. Runs free in your own Google account — paste your server link below (see setup steps).</p>
-    <label class="f"><span>Server link (Apps Script web app URL)</span><input id="cloudUrl" value="${esc(settings.cloudUrl)}" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off"></label>
-    <details style="margin-bottom:10px"><summary class="mut" style="font-size:14px">New phone? Enter your owner key</summary><input id="ownerKeyIn" placeholder="Owner key from your old phone or backup" style="margin-top:8px" autocomplete="off"></details>
-    <button class="btn wide" data-a="cloudconnect">${icon('cloud', 18)} Connect</button></section>`;
-  const n = cloud.subs.filter(s => s.active).length;
-  return `<section class="card"><h3>Cloud &amp; subcontractors <em style="color:#2E7D4F">● Connected</em></h3>
-    <p class="hint">${settings.ownerEmail ? 'Google account: ' + esc(settings.ownerEmail) + '. ' : ''}Last sync: ${cloud.lastSync ? fmtTs(cloud.lastSync) : 'never'}.</p>
-    <a class="btn gold wide" href="#/subs">${icon('users', 18)} Subcontractors (${n})</a>
-    <div class="btns" style="margin-top:10px"><button class="btn ghost" data-a="cloudsync">${icon('refresh', 18)} Sync now</button><button class="btn ghost" data-a="ownerkey">Owner key</button></div>
-    <button class="add" style="margin-top:10px;width:100%" data-a="clouddisconnect">Disconnect this phone</button></section>`;
-});
-ACT.cloudconnect = async () => {
-  const url = ($('#cloudUrl').value || '').trim();
-  if (!/^https?:\/\/\S+$/.test(url)) return toast('Paste the web app link (it ends in /exec)');
-  const typed = ($('#ownerKeyIn') && $('#ownerKeyIn').value || '').trim();
-  const key = typed || settings.ownerKey || genKey();
-  const prev = {cloudUrl: settings.cloudUrl, ownerKey: settings.ownerKey};
-  Object.assign(settings, {cloudUrl: url, ownerKey: key, role: 'owner'});
-  toast('Connecting…');
+/* ---------- sign in / password ---------- */
+function renderSignIn() {
+  document.body.classList.add('detail');
+  $('#tabs').innerHTML = '';
+  $('#top').innerHTML = `<a class="ib" href="#/jobs" data-a="signinback" aria-label="Back">${icon('back', 24)}</a><div class="title">Sign in</div>`;
+  main.innerHTML = `${typeof installBanner === 'function' ? installBanner() : ''}<section class="card"><h3>Paste your sign-in message</h3>
+    <p class="hint">Copy the whole message you got by WhatsApp, text or email (press and hold → Copy), then paste it here. The details below fill in.</p>
+    <textarea id="inv" rows="4" placeholder="Paste the message here"></textarea>
+    <button class="btn ghost wide" style="margin-top:8px" data-a="invpaste">Paste from clipboard</button></section>
+    <section class="card"><h3>Your sign-in</h3>
+    <label class="f"><span>Server link</span><input id="siUrl" value="${esc(settings.cloudUrl)}" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off"></label>
+    <div class="row"><label class="f"><span>Username</span><input id="siUser" autocomplete="username" autocapitalize="none"></label><label class="f"><span>Password</span><input id="siPass" type="password" autocomplete="current-password"></label></div>
+    <button class="btn gold wide" data-a="signin">Sign in</button></section>`;
+}
+function parseInvite(t) {
+  return {url: (t.match(/https?:\/\/[^\s]+\/exec\b/) || [])[0] || '',
+    username: ((t.match(/username\s*:\s*(\S+)/i) || [])[1] || ''),
+    password: ((t.match(/password\s*:\s*(\S+)/i) || [])[1] || '')};
+}
+function fillFromInvite(text) {
+  const v = parseInvite(text || '');
+  if (v.url) $('#siUrl').value = v.url; if (v.username) $('#siUser').value = v.username; if (v.password) $('#siPass').value = v.password;
+  return v;
+}
+INPUT_HOOKS.push(t => { if (t.id !== 'inv') return false; fillFromInvite(t.value); return true; });
+ACT.invpaste = () => {
+  const done = t => { $('#inv').value = t; const v = fillFromInvite(t); if (!v.username) toast('No sign-in details found in that text'); };
+  const t = NB && NB.readClipboard ? NB.readClipboard() : '';
+  if (t) return done(t);
+  if (navigator.clipboard && navigator.clipboard.readText) navigator.clipboard.readText().then(done, () => toast('Press and hold in the box, then Paste'));
+  else toast('Press and hold in the box, then Paste');
+};
+ACT.signinback = (b, j, e) => { e.preventDefault(); if (settings.role === 'sub' && !signedIn()) settings.role = ''; saveSettings(); location.hash = '#/jobs'; route(); };
+async function doLogin(url, username, password) {
+  if (!/^https?:\/\/\S+$/.test(url)) return toast('Enter the server link (it ends in /exec)');
+  if (!username || !password) return toast('Enter your username and password');
+  const prevUrl = settings.cloudUrl; settings.cloudUrl = url;
+  toast('Signing in…');
   try {
-    const r = await api('ownerConnect', {bizName: settings.bizName});
-    Object.assign(settings, {ownerOk: true, ownerEmail: r.email || ''}); saveSettings();
-    toast(r.claimed ? 'Connected — this phone is the owner' : 'Connected');
-    await syncCloud(true); rerender();
-  } catch (e) {
-    Object.assign(settings, prev, {ownerOk: false}); saveSettings();
-    toast('Could not connect: ' + e.message);
-  }
+    const r = await api('login', {username, password});
+    Object.assign(settings, {token: r.token, me: r.user, mustChange: !!r.mustChange, subBiz: r.biz, role: r.user.role === 'admin' ? 'owner' : 'sub'});
+    if (r.user.role === 'admin') settings.ownerEmail = r.email || '';
+    saveSettings(); pendingPw = password;
+    toast(`Signed in as ${r.user.name}`);
+    location.hash = '#/jobs'; route();
+    if (!r.mustChange) afterSignIn();
+  } catch (e) { settings.cloudUrl = prevUrl || url; saveSettings(); toast(e.message); }
+}
+function afterSignIn() { if (isOwnerCloud()) syncCloud(true); else if (settings.role === 'sub') subRefresh(); }
+ACT.signin = () => doLogin(($('#siUrl').value || '').trim(), ($('#siUser').value || '').trim(), $('#siPass').value || '');
+function renderPwChange() {
+  document.body.classList.add('detail');
+  $('#tabs').innerHTML = '';
+  $('#top').innerHTML = `<div class="brand"><small>${esc(settings.subBiz || 'Redwood Jobs')}</small><b>Set your password</b></div>`;
+  main.innerHTML = `<section class="card"><h3>Choose your own password</h3>
+    <p class="hint">Hi ${esc((settings.me && settings.me.name || '').split(/\s+/)[0])}. You signed in with a temporary password. Set your own to continue — at least 8 characters, with letters and numbers.</p>
+    ${pendingPw ? '' : `<label class="f"><span>Temporary password</span><input id="pwOld" type="password" autocomplete="current-password"></label>`}
+    <label class="f"><span>New password</span><input id="pwNew" type="password" autocomplete="new-password"></label>
+    <label class="f"><span>Type it again</span><input id="pwNew2" type="password" autocomplete="new-password"></label>
+    <button class="btn gold wide" data-a="pwsave">Save password</button></section>
+    <button class="add" style="width:100%" data-a="signout">Sign out</button>`;
+}
+async function changePw(oldPassword, newPassword, again) {
+  if (newPassword !== again) { toast('The two new passwords don\'t match'); return false; }
+  const p = pwProblem(newPassword); if (p) { toast(p); return false; }
+  try {
+    const r = await api('changePassword', {oldPassword, newPassword});
+    Object.assign(settings, {me: r.user, mustChange: false}); saveSettings(); pendingPw = '';
+    toast('Password saved'); return true;
+  } catch (e) { toast(e.message); return false; }
+}
+ACT.pwsave = async () => {
+  const ok = await changePw(pendingPw || ($('#pwOld') ? $('#pwOld').value : ''), $('#pwNew').value, $('#pwNew2').value);
+  if (ok) { location.hash = '#/jobs'; route(); afterSignIn(); }
+};
+ACT.pwchange = () => {
+  const m = sheet(`<h4>Change password</h4>
+    <label class="f"><span>Current password</span><input id="cpOld" type="password" autocomplete="current-password"></label>
+    <label class="f"><span>New password</span><input id="cpNew" type="password" autocomplete="new-password"></label>
+    <label class="f"><span>Type it again</span><input id="cpNew2" type="password" autocomplete="new-password"></label>
+    <button class="btn gold wide" data-k="save">Save</button>`);
+  m.onclick = async e => {
+    if (e.target.closest('[data-close]')) return closeSheet();
+    if (!e.target.closest('[data-k]')) return;
+    if (await changePw($('#cpOld').value, $('#cpNew').value, $('#cpNew2').value)) closeSheet();
+  };
+};
+ACT.signout = async () => {
+  if (!await ask('Sign out of your account on this phone?', 'Sign out')) return;
+  api('logout').catch(() => {});
+  Object.assign(settings, {token: '', me: null, mustChange: false}); pendingPw = ''; saveSettings();
+  location.hash = '#/jobs'; route();
+};
+
+/* ================= OWNER / ADMIN ================= */
+MORE_SECTIONS.unshift(() => {
+  if (!isOwnerCloud()) return `<section class="card"><h3>Cloud &amp; team</h3>
+    <p class="hint">Sign in to your server to give subcontractors their own sign-ins, send them jobs, collect their prices, and get estimates signed online. Runs free in your own Google account (see setup steps).</p>
+    <label class="f"><span>Server link</span><input id="cUrl" value="${esc(settings.cloudUrl)}" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off"></label>
+    <div class="row"><label class="f"><span>Username</span><input id="cUser" value="${esc(settings.me && settings.me.username || '')}" autocomplete="username" autocapitalize="none"></label><label class="f"><span>Password</span><input id="cPass" type="password" autocomplete="current-password"></label></div>
+    <button class="btn wide" data-a="ownersignin">${icon('cloud', 18)} Sign in</button>
+    <button class="add" style="width:100%;margin-top:10px" data-a="adminsetup">First time on this server? Create the admin account</button></section>`;
+  const n = cloud.users.filter(u => u.active).length;
+  return `<section class="card"><h3>Cloud &amp; team <em style="color:#2E7D4F">● Connected</em></h3>
+    <p class="hint">Signed in as <b>${esc(settings.me.name)}</b> (${esc(settings.me.username)}, admin). Last sync: ${cloud.lastSync ? fmtTs(cloud.lastSync) : 'never'}</p>
+    <a class="btn gold wide" href="#/team">${icon('users', 18)} Team &amp; sign-ins (${n})</a>
+    <div class="btns" style="margin-top:10px"><button class="btn ghost" data-a="cloudsync">${icon('refresh', 18)} Sync now</button><button class="btn ghost" data-a="pwchange">Change password</button></div>
+    <button class="add" style="margin-top:10px;width:100%" data-a="signout">Sign out of cloud</button></section>`;
+});
+ACT.ownersignin = () => doLogin(($('#cUrl').value || '').trim(), ($('#cUser').value || '').trim(), $('#cPass').value || '');
+ACT.adminsetup = () => {
+  const url = ($('#cUrl').value || '').trim();
+  if (!/^https?:\/\/\S+$/.test(url)) return toast('Paste the server link first (it ends in /exec)');
+  const m = sheet(`<h4>Create the admin account</h4><p class="hint">This is your own sign-in. Admins can see and do everything; subcontractors only see jobs you send them.</p>
+    <label class="f"><span>Your name</span><input id="saName" autocomplete="name"></label>
+    <label class="f"><span>Username</span><input id="saUser" autocapitalize="none" autocomplete="username"></label>
+    <label class="f"><span>Password (8+ letters and numbers)</span><input id="saPass" type="password" autocomplete="new-password"></label>
+    <label class="f"><span>Type it again</span><input id="saPass2" type="password" autocomplete="new-password"></label>
+    <button class="btn gold wide" data-k="go">Create admin account</button>`);
+  m.oninput = e => { if (e.target.id === 'saName' && !$('#saUser').dataset.edited) $('#saUser').value = normUser(e.target.value.split(/\s+/)[0]); if (e.target.id === 'saUser') e.target.dataset.edited = 1; };
+  m.onclick = async e => {
+    if (e.target.closest('[data-close]')) return closeSheet();
+    if (!e.target.closest('[data-k]')) return;
+    const name = $('#saName').value.trim(), username = normUser($('#saUser').value), password = $('#saPass').value;
+    if (!name || !username) return toast('Enter your name and a username');
+    if (password !== $('#saPass2').value) return toast('The passwords don\'t match');
+    const p = pwProblem(password); if (p) return toast(p);
+    const prevUrl = settings.cloudUrl; settings.cloudUrl = url;
+    try {
+      const r = await api('setupAdmin', {name, username, password, bizName: settings.bizName, key: settings.ownerKey || ''});
+      Object.assign(settings, {token: r.token, me: r.user, mustChange: false, role: 'owner', ownerEmail: r.email || '', subBiz: r.biz}); saveSettings();
+      closeSheet(); toast('Admin account created'); await syncCloud(true); rerender();
+    } catch (err) { settings.cloudUrl = prevUrl; saveSettings(); toast(err.message); }
+  };
 };
 ACT.cloudsync = async () => { toast('Syncing…'); await syncCloud(true); rerender(); };
-ACT.clouddisconnect = async () => {
-  if (!await ask('Disconnect this phone from the cloud? Your jobs stay on the phone. Keep your owner key if you want to reconnect.', 'Disconnect')) return;
-  settings.ownerOk = false; saveSettings(); rerender();
-};
-ACT.ownerkey = () => {
-  const m = sheet(`<h4>Owner key</h4><p class="hint">This key proves this phone is the owner. You need it to connect a new phone. It is also saved in your backups — keep backups private.</p>
-    <div style="font-family:monospace;font-size:14px;word-break:break-all;background:#FAF9F6;border:1px solid var(--line);border-radius:10px;padding:12px">${esc(settings.ownerKey)}</div>
-    <div class="btns" style="margin-top:12px"><button class="btn ghost" data-k="copy">Copy</button><button class="btn" data-close>Done</button></div>`);
-  m.onclick = e => { if (e.target.closest('[data-close]')) return closeSheet(); if (e.target.closest('[data-k]')) copyText(settings.ownerKey); };
-};
 
 let syncing = null;
 const WORK = {accepted: 'accepted the job', started: 'started work', done: 'finished the job'};
@@ -126,8 +231,8 @@ function syncCloud(force) {
     try {
       const first = !cloud.lastSync;
       const before = new Map(cloud.assigns.map(a => [a.id, a]));
-      const [assigns, subs] = await Promise.all([api('assignsList'), api('subsList')]);
-      cloud.assigns = assigns; cloud.subs = subs; cloud.lastSync = Date.now();
+      const [assigns, users] = await Promise.all([api('assignsList'), api('usersList')]);
+      cloud.assigns = assigns; setUsers(users); cloud.lastSync = Date.now();
       const news = [];
       assigns.forEach(a => {
         const o = before.get(a.id), j = jobs.find(x => x.id === a.jobId);
@@ -169,47 +274,68 @@ function recordOnline(j, s) {
 const bidsForJob = jobId => cloud.assigns.filter(a => a.jobId === jobId && a.bid && !['cancelled', 'declined'].includes(a.status));
 const bidById = id => cloud.assigns.find(a => a.id === id);
 
-/* ---------- subcontractor management ---------- */
-VIEWS.subs = {detail: true, render() {
-  $('#top').innerHTML = `<a class="ib" href="#/more" data-a="back" aria-label="Back">${icon('back', 24)}</a><div class="title">Subcontractors</div><button class="ib" data-a="subsload" aria-label="Refresh">${icon('refresh')}</button>`;
-  main.innerHTML = subsHTML();
-  if (isOwnerCloud() && !VIEWS.subs.loaded) { VIEWS.subs.loaded = true; ACT.subsload(); }
+/* ---------- team & sign-ins (admin) ---------- */
+VIEWS.team = VIEWS.subs = {detail: true, render() {
+  $('#top').innerHTML = `<a class="ib" href="#/more" data-a="back" aria-label="Back">${icon('back', 24)}</a><div class="title">Team &amp; sign-ins</div><button class="ib" data-a="teamload" aria-label="Refresh">${icon('refresh')}</button>`;
+  main.innerHTML = teamHTML();
+  if (isOwnerCloud() && !VIEWS.team.loaded) { VIEWS.team.loaded = true; ACT.teamload(); }
 }};
-function subsHTML() {
-  if (!isOwnerCloud()) return `<div class="empty">Connect the cloud first (More → Cloud &amp; subcontractors).</div>`;
-  const list = cloud.subs;
-  return `<section class="card"><h3>Add subcontractor</h3>
-      <div class="row"><label class="f"><span>Name</span><input id="nsName" placeholder="Raj Singh" autocomplete="off"></label><label class="f"><span>Trade</span><input id="nsTrade" placeholder="Fence crew" autocomplete="off"></label></div>
-      <div class="row"><label class="f"><span>Phone</span><input id="nsPhone" type="tel" autocomplete="off"></label><label class="f"><span>Email</span><input id="nsEmail" type="email" autocomplete="off"></label></div>
-      <button class="btn wide" data-a="subadd">${icon('plus', 18)} Add &amp; create invite</button></section>
-    ${list.length ? list.map(s => `<section class="card" style="${s.active ? '' : 'opacity:.6'}"><h3>${esc(s.name)} <em>${s.active ? (s.devices ? 'Signed in' : 'Invite not used yet') : 'Turned off'}</em></h3>
-      <div class="hint" style="margin-bottom:8px">${[s.trade, s.phone, s.email].filter(Boolean).map(esc).join(' · ')}${s.lastSeen ? '<br>Last sign-in ' + fmtTs(s.lastSeen) : ''}</div>
-      ${s.active ? `<div style="font-family:monospace;font-size:18px;letter-spacing:.1em;margin-bottom:10px">Code: <b>${esc(s.code)}</b></div>` : ''}
-      <div class="btns">${s.active ? `<button class="btn" data-a="subinvite" data-id="${s.id}">${icon('send', 18)} Send invite</button>` : ''}<button class="btn ghost" data-a="submenu" data-id="${s.id}">More…</button></div></section>`).join('')
-    : `<div class="empty">No subcontractors yet. Add one above, then send them the invite.</div>`}`;
+const ROLE_LBL = {admin: ['Admin', '#8A6414', '#F6ECD3'], sub: ['Subcontractor', '#2B679B', '#E3EDF7']};
+const rpill = r => { const x = ROLE_LBL[r] || [r, '#56636C', '#EAEEF0']; return `<span class="pill" style="color:${x[1]};background:${x[2]}">${x[0]}</span>`; };
+function userStatus(u) {
+  if (!u.active) return '<span class="pill" style="color:#A23B3B;background:#F5E0E0">Turned off</span>';
+  if (u.mustChange) return `<span class="pill" style="color:#8A6414;background:#F6ECD3">${u.lastLogin ? 'Must set password' : 'Not signed in yet'}</span>`;
+  return '<span class="pill" style="color:#2E7D4F;background:#E0F0E6">Active</span>';
 }
-ACT.subsload = async () => { try { cloud.subs = await api('subsList'); saveCloud(); if (location.hash === '#/subs') rerender(); } catch (e) { toast(e.message); } };
-ACT.subadd = async () => {
-  const sub = {name: $('#nsName').value.trim(), trade: $('#nsTrade').value.trim(), phone: $('#nsPhone').value.trim(), email: $('#nsEmail').value.trim()};
-  if (!sub.name) return toast('Enter a name');
-  try { const s = await api('subSave', {sub}); cloud.subs.push(s); saveCloud(); rerender(); toast(`${s.name} added — code ${s.code}`); setTimeout(() => inviteSheet(s), 300); }
+function teamHTML() {
+  if (!isOwnerCloud()) return `<div class="empty">Sign in to the cloud first (More → Cloud &amp; team).</div>`;
+  const list = cloud.users.slice().sort((a, b) => (a.role === b.role ? 0 : a.role === 'admin' ? -1 : 1) || a.name.localeCompare(b.name));
+  return `<section class="card"><h3>Add a person</h3>
+      <div class="row"><label class="f"><span>Name</span><input id="nuName" placeholder="Raj Singh" autocomplete="off"></label><label class="f"><span>Username</span><input id="nuUser" placeholder="raj.singh" autocapitalize="none" autocomplete="off"></label></div>
+      <div class="row"><label class="f"><span>Role</span><select id="nuRole"><option value="sub">Subcontractor</option><option value="admin">Admin (full access)</option></select></label><label class="f"><span>Trade</span><input id="nuTrade" placeholder="Fence crew" autocomplete="off"></label></div>
+      <div class="row"><label class="f"><span>Phone</span><input id="nuPhone" type="tel" autocomplete="off"></label><label class="f"><span>Email</span><input id="nuEmail" type="email" autocomplete="off"></label></div>
+      <button class="btn wide" data-a="useradd">${icon('plus', 18)} Create sign-in</button>
+      <p class="hint" style="margin:8px 0 0">They get a temporary password and must set their own the first time they sign in.</p></section>
+    ${list.map(u => { const me = settings.me && u.id === settings.me.id; return `<section class="card" style="${u.active ? '' : 'opacity:.65'}"><h3>${esc(u.name)}${me ? ' (you)' : ''} <em>${rpill(u.role)}</em></h3>
+      <div class="jm" style="margin:0 0 8px">${userStatus(u)}<span>@${esc(u.username)}</span></div>
+      <div class="hint" style="margin-bottom:10px">${[u.trade, u.phone, u.email].filter(Boolean).map(esc).join(' · ') || '&nbsp;'}${u.lastLogin ? '<br>Last sign-in ' + fmtTs(u.lastLogin) : ''}</div>
+      <div class="btns">${me ? `<button class="btn ghost" data-a="pwchange">Change my password</button>` : `<button class="btn ghost" data-a="userreset" data-id="${u.id}">${icon('send', 18)} New password &amp; send</button><button class="btn ghost" data-a="usermenu" data-id="${u.id}">More…</button>`}</div></section>`; }).join('')}`;
+}
+INPUT_HOOKS.push(t => {
+  if (t.id === 'nuName') { const u = $('#nuUser'); if (u && !u.dataset.edited) u.value = normUser(t.value.trim().split(/\s+/).slice(0, 2).join('.')); return true; }
+  if (t.id === 'nuUser') { t.dataset.edited = 1; return true; }
+  return false;
+});
+ACT.teamload = async () => { try { setUsers(await api('usersList')); saveCloud(); if (/^#\/(team|subs)/.test(location.hash)) rerender(); } catch (e) { toast(e.message); } };
+ACT.useradd = async () => {
+  const user = {name: $('#nuName').value.trim(), username: normUser($('#nuUser').value || $('#nuName').value), role: $('#nuRole').value, trade: $('#nuTrade').value.trim(), phone: $('#nuPhone').value.trim(), email: $('#nuEmail').value.trim()};
+  if (!user.name) return toast('Enter a name');
+  try {
+    const r = await api('userSave', {user});
+    setUsers(cloud.users.concat([r.user])); saveCloud(); rerender();
+    setTimeout(() => credsSheet(r.user, r.tempPassword), 250);
+  } catch (e) { toast(e.message); }
+};
+ACT.userreset = async b => {
+  const u = cloud.users.find(x => x.id === b.dataset.id); if (!u) return;
+  if (!await ask(`Give ${u.name} a new temporary password? Their old password stops working and they'll set a new one.`, 'New password', false)) return;
+  try { const r = await api('userResetPassword', {id: u.id}); Object.assign(u, r.user); saveCloud(); rerender(); setTimeout(() => credsSheet(r.user, r.tempPassword), 250); }
   catch (e) { toast(e.message); }
 };
-ACT.subinvite = b => { const s = cloud.subs.find(x => x.id === b.dataset.id); if (s) inviteSheet(s); };
-ACT.submenu = b => {
-  const s = cloud.subs.find(x => x.id === b.dataset.id); if (!s) return;
-  const m = sheet(`<h4>${esc(s.name)}</h4>
-    <button class="opt" data-k="reset">${icon('refresh')}<div><b>New invite code</b><span>Signs them out of every phone</span></div></button>
-    <button class="opt" data-k="toggle">${icon('users')}<div><b>${s.active ? 'Turn off access' : 'Turn access back on'}</b><span>${s.active ? 'They stop seeing your jobs' : 'Reactivates their code'}</span></div></button>
-    <button class="opt" data-k="del" style="color:var(--red)">${icon('trash')}<div><b>Remove</b><span>Deletes this subcontractor</span></div></button>`);
+ACT.usermenu = b => {
+  const u = cloud.users.find(x => x.id === b.dataset.id); if (!u) return;
+  const m = sheet(`<h4>${esc(u.name)}</h4>
+    <button class="opt" data-k="role">${icon('users')}<div><b>${u.role === 'admin' ? 'Make subcontractor' : 'Make admin'}</b><span>${u.role === 'admin' ? 'Only sees jobs sent to them' : 'Full access to everything'}</span></div></button>
+    <button class="opt" data-k="toggle">${icon('x')}<div><b>${u.active ? 'Turn off sign-in' : 'Turn sign-in back on'}</b><span>${u.active ? 'Signs them out everywhere' : 'They can sign in again'}</span></div></button>
+    <button class="opt" data-k="del" style="color:var(--red)">${icon('trash')}<div><b>Remove</b><span>Deletes this sign-in</span></div></button>`);
   m.onclick = async e => {
     if (e.target.closest('[data-close]')) return closeSheet();
     const k = e.target.closest('[data-k]'); if (!k) return; closeSheet();
     try {
-      if (k.dataset.k === 'reset') { const n = await api('subResetCode', {id: s.id}); Object.assign(s, n); toast('New code ' + n.code); }
-      if (k.dataset.k === 'toggle') { const n = await api('subSave', {sub: Object.assign({}, s, {active: !s.active})}); Object.assign(s, n); }
-      if (k.dataset.k === 'del') { if (!await ask(`Remove ${s.name}? They lose access to all jobs.`, 'Remove')) return; await api('subDelete', {id: s.id}); cloud.subs = cloud.subs.filter(x => x.id !== s.id); }
-      saveCloud(); rerender();
+      if (k.dataset.k === 'role') { if (!await ask(u.role === 'admin' ? `Make ${u.name} a subcontractor? They lose admin access.` : `Make ${u.name} an admin? They will see all prices, clients and team sign-ins.`, 'Change', u.role !== 'admin')) return; const r = await api('userSave', {user: {id: u.id, role: u.role === 'admin' ? 'sub' : 'admin'}}); Object.assign(u, r.user); }
+      if (k.dataset.k === 'toggle') { const r = await api('userSave', {user: {id: u.id, active: !u.active}}); Object.assign(u, r.user); }
+      if (k.dataset.k === 'del') { if (!await ask(`Remove ${u.name}? They lose access right away.`, 'Remove')) return; await api('userDelete', {id: u.id}); cloud.users = cloud.users.filter(x => x.id !== u.id); }
+      setUsers(cloud.users); saveCloud(); rerender();
     } catch (err) { toast(err.message); }
   };
 };
@@ -224,22 +350,28 @@ async function apkLink() {
     return cloud.apk.url;
   } catch (e) { return ''; }
 }
-async function inviteSheet(s) {
-  const link = await apkLink();
-  const first = s.name.split(/\s+/)[0];
-  const msg = `Hi ${first}, it's ${settings.bizName}. I'll send you job details through our Redwood Jobs app, and you can send me your prices there.\n\n` +
+function signInMessage(u, temp, link) {
+  const first = (u.name || '').split(/\s+/)[0];
+  return `Hi ${first}, it's ${settings.bizName}. Here's your sign-in for our Redwood Jobs app.\n\n` +
     `1) Install the app\n   iPhone: open ${webAppUrl()} in Safari, tap Share, then "Add to Home Screen". Open it from your home screen.\n` +
     `   Android: ${link ? link + ' (allow installing from your browser if asked)' : 'ask me for the app file'}\n` +
-    `2) Open Redwood Jobs, tap "I'm a subcontractor" and paste this whole message.\n\nServer: ${settings.cloudUrl}\nCode: ${s.code}`;
-  const m = sheet(`<h4>Invite ${esc(s.name)}</h4><div class="termsbox" style="max-height:180px">${esc(msg)}</div>
-    <div class="sharegrid" style="margin-top:12px"><button data-s="whatsapp">${icon('msg')}WhatsApp</button><button data-s="sms">${icon('phone')}Text</button><button data-s="email">${icon('doc')}Email</button><button data-s="copy">${icon('copy')}Copy</button></div>
+    `2) Open Redwood Jobs, tap "Sign in" and paste this whole message. You'll set your own password.\n\n` +
+    `Server: ${settings.cloudUrl}\nUsername: ${u.username}\nTemporary password: ${temp}`;
+}
+async function credsSheet(u, temp) {
+  const link = await apkLink();
+  const msg = signInMessage(u, temp, link);
+  const m = sheet(`<h4>Sign-in for ${esc(u.name)}</h4>
+    <div class="creds"><div><span>Username</span><b>${esc(u.username)}</b></div><div><span>Temporary password</span><b>${esc(temp)}</b></div></div>
+    <p class="hint" style="margin:8px 0">Shown only now. Send it to them — they'll set their own password when they sign in.</p>
+    <div class="sharegrid"><button data-s="whatsapp">${icon('msg')}WhatsApp</button><button data-s="sms">${icon('phone')}Text</button><button data-s="email">${icon('doc')}Email</button><button data-s="copy">${icon('copy')}Copy</button></div>
     ${NB && NB.shareApk ? `<button class="btn ghost wide" style="margin-top:10px" data-s="apk">Send the app file too (WhatsApp, Bluetooth…)</button>` : ''}`);
   m.onclick = e => {
     if (e.target.closest('[data-close]')) return closeSheet();
     const b = e.target.closest('[data-s]'); if (!b) return; const t = b.dataset.s;
-    if (t === 'apk') { const r = NB.shareApk(msg, 'any', phoneIntl(s.phone)); if (r) toast(r); return; }
-    closeSheet();
-    if (t === 'copy') copyText(msg); else shareTextVia(t, t === 'email' ? '' : phoneIntl(s.phone), s.email, 'Redwood Jobs invite', msg);
+    if (t === 'apk') { const r = NB.shareApk(msg, 'any', phoneIntl(u.phone)); if (r) toast(r); return; }
+    if (t === 'copy') return copyText(msg);
+    shareTextVia(t, t === 'email' ? '' : phoneIntl(u.phone), u.email, 'Your Redwood Jobs sign-in', msg);
   };
 }
 
@@ -247,7 +379,7 @@ async function inviteSheet(s) {
 const OWN_ST = {sent: ['Waiting for price', '#8A6414', '#F6ECD3'], bid: ['Price received', '#2B679B', '#E3EDF7'], awarded: ['Awarded', '#2E7D4F', '#E0F0E6'], notawarded: ['Not awarded', '#56636C', '#EAEEF0'], declined: ['Declined', '#A23B3B', '#F5E0E0']};
 const opill = s => { const x = OWN_ST[s] || [s, '#56636C', '#EAEEF0']; return `<span class="pill" style="color:${x[1]};background:${x[2]}">${x[0]}</span>`; };
 JOB_CARDS.beforeMoney.push(j => {
-  if (!isOwnerCloud()) return `<section class="card"><h3>Subcontractors</h3><p class="hint" style="margin-bottom:10px">Send this job to your subs and get their prices back in the app.</p><a class="btn ghost wide" href="#/more">${icon('cloud', 18)} Set up cloud</a></section>`;
+  if (!isOwnerCloud()) return `<section class="card"><h3>Subcontractors</h3><p class="hint" style="margin-bottom:10px">Send this job to your subs and get their prices back in the app.</p><a class="btn ghost wide" href="#/more">${icon('cloud', 18)} Sign in to cloud</a></section>`;
   const list = cloud.assigns.filter(a => a.jobId === j.id && a.status !== 'cancelled');
   return `<section class="card"><h3>Subcontractors <em>${list.length ? list.filter(a => a.bid).length + ' of ' + list.length + ' priced' : ''}</em></h3>
     ${list.map(a => {
@@ -276,9 +408,9 @@ function buildSheet(j, opt) {
 }
 ACT.asgsend = async (b, j) => {
   if (!j) return;
-  if (!cloud.subs.length) { try { cloud.subs = await api('subsList'); } catch (e) {} }
+  if (!cloud.subs.length) { try { setUsers(await api('usersList')); } catch (e) {} }
   const subs = cloud.subs.filter(s => s.active);
-  if (!subs.length) { if (await ask('You have no subcontractors yet. Add one now?', 'Add', false)) location.hash = '#/subs'; return; }
+  if (!subs.length) { if (await ask('You have no subcontractor sign-ins yet. Add one now?', 'Add', false)) location.hash = '#/team'; return; }
   const sent = new Set(cloud.assigns.filter(a => a.jobId === j.id && a.status !== 'cancelled').map(a => a.subId));
   const opt = j.subShare || {phone: false, photos: true, notes: j.notes.filter(n => !n.sys).map(n => n.t).reverse().join('\n')};
   const lines = sheetLines(j);
@@ -369,7 +501,7 @@ function clientEst(j) {
     client: {name: jobName(j), address: j.client.address, phone: j.client.phone, email: j.client.email},
     biz: {name: settings.bizName, phone: settings.bizPhone, email: settings.bizEmail, web: settings.bizWeb, address: settings.bizAddress, hstNo: settings.hstNo},
     rows: c.rows.map(r => ({desc: r.l.desc, qty: num(r.l.qty), unit: r.l.unit, rate: r.rate, amt: r.amt})),
-    sub: c.sub, taxAmt: c.tax, total: c.total, dep: c.dep, scope: e.scope, terms: termsText(e), project: [j.type, j.material].filter(Boolean).join(' · '), jobId: j.id};
+    sub: c.sub, disc: c.disc, discLabel: discLabel(e), net: c.net, taxAmt: c.tax, total: c.total, dep: c.dep, scope: e.scope, terms: termsText(e), project: [j.type, j.material].filter(Boolean).join(' · '), jobId: j.id};
 }
 ACT.estlink = async () => {
   const j = estJob(); if (!j || j.est.sig) return;
@@ -413,15 +545,15 @@ function subTabs(view) {
   $('#tabs').innerHTML = [['jobs', 'My jobs', 'jobs'], ['more', 'Account', 'more']].map(([k, l, i]) => `<a href="#/${k}" class="${view === k ? 'on' : ''}"><span class="ic">${icon(i, 21)}</span>${l}</a>`).join('');
 }
 function subRoute(view, id, keep) {
-  if (!settings.subToken) return renderSubLogin();
+  if (!signedIn()) return renderSignIn();
   if (view === 'sj' && id) return renderSubJob(id, keep);
   document.body.classList.remove('detail');
   if (view === 'more') {
     subTabs('more');
     $('#top').innerHTML = `<div class="title">Account</div>`;
-    main.innerHTML = `<section class="card"><h3>Signed in</h3><p style="margin:0 0 4px"><b>${esc(settings.subName)}</b></p><p class="hint">Jobs from ${esc(settings.subBiz || 'the company')}</p>
-      <button class="btn ghost wide" data-a="subsignout">Sign out</button></section>
-      <section class="card"><h3>Use as my own tracker</h3><p class="hint">Switch this phone to business mode to track your own jobs. You can sign in as a subcontractor again later.</p><button class="btn ghost wide" data-a="subtoowner">Switch to business mode</button></section>
+    main.innerHTML = `<section class="card"><h3>Signed in</h3><p style="margin:0 0 2px"><b>${esc(settings.me.name)}</b> <span class="mut">@${esc(settings.me.username)}</span></p><p class="hint">Subcontractor for ${esc(settings.subBiz || 'the company')}</p>
+      <div class="btns"><button class="btn ghost" data-a="pwchange">Change password</button><button class="btn ghost" data-a="signout">Sign out</button></div></section>
+      <section class="card"><h3>Use as my own tracker</h3><p class="hint">Switch this phone to business mode to track your own jobs. This signs you out.</p><button class="btn ghost wide" data-a="subtoowner">Switch to business mode</button></section>
       <div class="about">Redwood Jobs ${esc(appVersion())}</div>`;
     return;
   }
@@ -430,41 +562,11 @@ function subRoute(view, id, keep) {
   main.innerHTML = subJobsHTML();
   if (!keep && Date.now() - subData.at > 10000) subRefresh();
 }
-function renderSubLogin() {
-  document.body.classList.add('detail');
-  $('#top').innerHTML = `<div class="brand"><small>Redwood Jobs</small><b>Subcontractor sign-in</b></div>`;
-  main.innerHTML = `${typeof installBanner === 'function' ? installBanner() : ''}<section class="card"><h3>Paste your invite</h3>
-    <p class="hint">Copy the whole invite message you got by WhatsApp or text (press and hold → Copy), then paste it here.</p>
-    <textarea id="inv" rows="6" placeholder="Paste the invite message here"></textarea>
-    <div class="btns" style="margin-top:10px"><button class="btn ghost" data-a="invpaste">Paste</button><button class="btn gold" data-a="invgo">Sign in</button></div></section>
-    <button class="add" style="width:100%" data-a="roleback">I'm the business owner instead</button>`;
-}
-function parseInvite(t) {
-  const url = (t.match(/https?:\/\/[^\s]+\/exec\b/) || [])[0] || '';
-  const code = ((t.match(/code\s*:?\s*([A-Z0-9]{4}-?[A-Z0-9]{4})\b/i) || [])[1] || (t.match(/\b([A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4})\b/i) || [])[1] || '').toUpperCase();
-  return {url, code};
-}
-ACT.invpaste = () => {
-  const t = NB && NB.readClipboard ? NB.readClipboard() : '';
-  if (t) { $('#inv').value = t; return; }
-  if (navigator.clipboard && navigator.clipboard.readText) navigator.clipboard.readText().then(x => { $('#inv').value = x; }, () => toast('Press and hold in the box, then Paste'));
-  else toast('Press and hold in the box, then Paste');
+ACT.subtoowner = async () => {
+  if (!await ask('Switch this phone to business mode? You will be signed out of your subcontractor account.', 'Switch', false)) return;
+  api('logout').catch(() => {});
+  Object.assign(settings, {role: 'owner', token: '', me: null, mustChange: false}); saveSettings(); location.hash = '#/jobs'; route();
 };
-ACT.invgo = async () => {
-  const {url, code} = parseInvite($('#inv').value || '');
-  if (!url || !code) return toast('Could not find the server link and code in that message');
-  settings.cloudUrl = url; settings.role = 'sub';
-  toast('Signing in…');
-  try {
-    const r = await api('subLogin', {code});
-    Object.assign(settings, {subToken: r.token, subName: r.name, subBiz: r.biz}); saveSettings();
-    subData = {jobs: [], at: 0, seen: {}, drafts: {}}; saveSub();
-    toast(`Welcome, ${r.name.split(/\s+/)[0]}`); location.hash = '#/jobs'; route(); subRefresh();
-  } catch (e) { toast(e.message); }
-};
-ACT.roleback = () => { settings.role = ''; saveSettings(); route(); };
-ACT.subsignout = async () => { if (!await ask('Sign out? You will need your invite code to sign in again.', 'Sign out')) return; Object.assign(settings, {subToken: '', subName: ''}); saveSettings(); route(); };
-ACT.subtoowner = async () => { if (!await ask('Switch this phone to business mode?', 'Switch', false)) return; Object.assign(settings, {role: 'owner', subToken: ''}); saveSettings(); location.hash = '#/jobs'; route(); };
 ACT.subrefresh = () => subRefresh(true);
 let subLoading = null;
 function subRefresh(loud) {
@@ -478,7 +580,6 @@ function subRefresh(loud) {
     const a = document.activeElement;
     if (!(a && /INPUT|TEXTAREA|SELECT/.test(a.tagName)) && $('#modal').hidden) rerender();
   }).catch(e => {
-    if (/sign in|turned off|expired/i.test(e.message)) { settings.subToken = ''; saveSettings(); route(); }
     if (loud || !subData.jobs.length) toast(e.message);
   }).finally(() => { subLoading = null; });
   return subLoading;

@@ -1,5 +1,5 @@
 /* Redwood Jobs service worker: keeps the app working offline. */
-const VERSION = 'rj-20261117.1653';
+const VERSION = 'rj-20261117.2335';
 const SHELL = ['./', 'index.html', 'app.js', 'est.js', 'cloud.js', 'pwa.js', 'jspdf.umd.min.js', 'jspdf.autotable.min.js',
   'manifest.webmanifest', 'icons/apple-touch-icon.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 self.addEventListener('install', e => {

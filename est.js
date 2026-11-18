@@ -61,7 +61,7 @@ function defaultScope(j) {
 function newEstimate(j) {
   const e = {no: num(settings.nextEstNo) || 1001, date: todayISO(), validDays: settings.validDays || '30', tax: settings.defaultTax || 'hst',
     markup: settings.markup || '25', deposit: settings.depositPct || '30', lines: linesFromJob(j), scope: defaultScope(j), terms: settings.terms || DEFAULT_TERMS,
-    sig: null, bidFrom: '', cloud: null, sentAt: 0};
+    disc: {type: 'pct', value: '', label: ''}, sig: null, bidFrom: '', cloud: null, sentAt: 0};
   settings.nextEstNo = e.no + 1; saveSettings();
   return e;
 }
@@ -71,19 +71,22 @@ function estCalc(e) {
   let sub = 0, cost = 0;
   const rows = e.lines.map(l => { const rate = round2(lineRate(l, e)); const amt = round2(num(l.qty) * rate); sub += amt; cost += num(l.qty) * num(l.cost); return {l, rate, amt}; });
   sub = round2(sub); cost = round2(cost);
-  const tax = e.tax === 'hst' ? round2(sub * HST_RATE / 100) : 0, total = round2(sub + tax);
-  return {rows, sub, tax, total, dep: round2(total * num(e.deposit) / 100), cost, profit: round2(sub - cost), margin: sub ? (sub - cost) / sub * 100 : 0};
+  const d = e.disc || {}, dv = num(d.value);
+  const disc = dv > 0 ? round2(Math.min(sub, d.type === 'amt' ? dv : sub * dv / 100)) : 0, net = round2(sub - disc);
+  const tax = e.tax === 'hst' ? round2(net * HST_RATE / 100) : 0, total = round2(net + tax);
+  return {rows, sub, disc, net, tax, total, dep: round2(total * num(e.deposit) / 100), cost, profit: round2(net - cost), margin: net ? (net - cost) / net * 100 : 0};
 }
+const discLabel = e => { const d = e.disc || {}; return (d.label || '').trim() || (d.type === 'amt' ? 'Discount' : `Discount (${num(d.value)}%)`); };
 const money2 = n => '$' + (n || 0).toLocaleString('en-CA', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const validUntil = e => addDays(e.date || todayISO(), num(e.validDays) || 30);
 function applyEstimate(j, quiet) {
   const e = j.est, c = estCalc(e);
-  j.price = String(c.sub); j.taxAmt = c.tax;
+  j.price = String(c.net); j.taxAmt = c.tax;
   let note = '';
   if (e.bidFrom && c.cost > 0) { j.labCost = String(c.cost); const b = (typeof bidById === 'function') && bidById(e.bidFrom); if (b && b.subName) j.crew = b.subName; }
   else if (c.cost > 0 && !num(j.matCost) && !num(j.labCost) && !num(j.otherCost)) { j.labCost = String(c.cost); note = ' · cost put in Labour / sub'; }
   saveJob(j, true);
-  if (!quiet) toast(`Contract price set to ${fmtMoney(c.sub)}${c.tax ? ' + HST ' + fmtMoney(c.tax) : ''}${note}`);
+  if (!quiet) toast(`Contract price set to ${fmtMoney(c.net)}${c.tax ? ' + HST ' + fmtMoney(c.tax) : ''}${note}`);
 }
 function markSent(j) {
   const e = j.est; e.sentAt = Date.now();
@@ -138,6 +141,13 @@ function estHTML(j) {
     <div class="qchips" style="margin-top:10px">${EXTRAS.map(([d, u]) => `<button data-a="estadd" data-v="${esc(d)}" data-u="${u}">+ ${esc(d)}</button>`).join('')}</div>
     <button class="btn ghost wide" style="margin-top:6px" data-a="estrebuild">Rebuild lines from measurements</button>`}
   </section>
+  <section class="card"><h3>Discount <em data-ec="disc">${c.disc ? '−' + money2(c.disc) : 'none'}</em></h3>
+    <div class="seg">${[['pct', '% off'], ['amt', '$ off']].map(([k, l]) => `<button class="${(e.disc || {}).type === k ? 'on' : ''}" data-a="estdisctype" data-v="${k}"${dis}>${l}</button>`).join('')}</div>
+    <div class="row" style="margin-top:12px"><label class="f"><span>${(e.disc || {}).type === 'amt' ? 'Amount ($)' : 'Percent (%)'}</span><input data-ed="value" value="${esc((e.disc || {}).value)}" inputmode="decimal" placeholder="0"${dis}></label>
+      <label class="f"><span>Label on estimate</span><input data-ed="label" value="${esc((e.disc || {}).label)}" placeholder="e.g. Fall promotion"${dis}></label></div>
+    ${lock ? '' : `<div class="qchips" style="margin:0">${[['pct', 5], ['pct', 10], ['pct', 15], ['amt', 250], ['amt', 500]].map(([t, v]) => `<button data-a="estdiscq" data-t="${t}" data-v="${v}">${t === 'pct' ? v + '%' : '$' + v}</button>`).join('')}<button data-a="estdiscq" data-t="pct" data-v="">Clear</button></div>`}
+    <p class="hint" style="margin:8px 0 0">Taken off before HST. Shows on the PDF and signing page.</p>
+  </section>
   <section class="card"><h3>Tax &amp; deposit</h3>
     <div class="seg">${[['hst', 'HST 13%'], ['none', 'Cash — no HST']].map(([k, l]) => `<button class="${e.tax === k ? 'on' : ''}" data-a="esttax" data-v="${k}"${dis}>${l}</button>`).join('')}</div>
     <div class="row" style="margin-top:12px">${f('Deposit %', 'deposit', e.deposit, {im: 'decimal'})}${f('Valid (days)', 'validDays', e.validDays, {im: 'numeric'})}</div>
@@ -162,6 +172,7 @@ function lineTotHTML(l, rate, amt) {
 function totalsHTML(e) {
   const c = estCalc(e);
   return `<div class="trow"><span>Subtotal</span><b>${money2(c.sub)}</b></div>
+    ${c.disc ? `<div class="trow" style="color:#2E7D4F"><span>${esc(discLabel(e))}</span><b>−${money2(c.disc)}</b></div><div class="trow"><span>After discount</span><b>${money2(c.net)}</b></div>` : ''}
     ${e.tax === 'hst' ? `<div class="trow"><span>HST 13%</span><b>${money2(c.tax)}</b></div>` : `<div class="trow mut"><span>No HST (cash price)</span><b>—</b></div>`}
     <div class="trow big"><span>Total</span><b>${money2(c.total)}</b></div>
     <div class="trow"><span>Deposit on signing (${num(e.deposit)}%)</span><b>${money2(c.dep)}</b></div>
@@ -174,16 +185,20 @@ function updateEst(j) {
     const r = main.querySelector(`[data-el="${l.id}"][data-k="rate"]`); if (r) { r.placeholder = rate ? rate.toFixed(2) : '0'; r.classList.toggle('ovr', hasOverride(l)); }
   });
   const s = main.querySelector('[data-ec="sub"]'); if (s) s.textContent = money2(c.sub);
+  const dd = main.querySelector('[data-ec="disc"]'); if (dd) dd.textContent = c.disc ? '−' + money2(c.disc) : 'none';
   const t = main.querySelector('[data-ec="totals"]'); if (t) t.innerHTML = totalsHTML(e);
 }
 INPUT_HOOKS.push(t => {
-  if (!t.dataset.e && !t.dataset.el) return false;
+  if (!t.dataset.e && !t.dataset.el && !t.dataset.ed) return false;
   const j = estJob(); if (!j || !j.est || j.est.sig) return true;
   const e = j.est;
-  if (t.dataset.e) e[t.dataset.e] = t.value;
+  if (t.dataset.ed) { e.disc = e.disc || {type: 'pct', value: '', label: ''}; e.disc[t.dataset.ed] = t.value; }
+  else if (t.dataset.e) e[t.dataset.e] = t.value;
   else { const l = e.lines.find(x => x.id === t.dataset.el); if (l) { l[t.dataset.k] = t.value; if (t.dataset.k === 'rate' && hasOverride(l)) { settings.rateMem = settings.rateMem || {}; settings.rateMem[memKey(l, j)] = l.rate; saveSettings(); } } }
   saveJob(j); updateEst(j); return true;
 });
+ACT.estdisctype = b => { const j = estJob(); if (!j || j.est.sig) return; j.est.disc = Object.assign({type: 'pct', value: '', label: ''}, j.est.disc, {type: b.dataset.v, value: ''}); saveJob(j); rerender(); };
+ACT.estdiscq = b => { const j = estJob(); if (!j || j.est.sig) return; j.est.disc = Object.assign({label: ''}, j.est.disc, {type: b.dataset.t, value: b.dataset.v}); saveJob(j); rerender(); };
 ACT.estmk = b => { const j = estJob(); if (!j || j.est.sig) return; j.est.markup = b.dataset.v; saveJob(j); rerender(); };
 ACT.esttax = b => { const j = estJob(); if (!j || j.est.sig) return; j.est.tax = b.dataset.v; saveJob(j); rerender(); };
 ACT.estadd = b => {
@@ -264,8 +279,9 @@ function buildPdf(j, e) {
   y = doc.lastAutoTable.finalY + 14;
 
   // totals
-  const need = 110; if (y + need > H - 60) { doc.addPage(); y = 56; }
+  const need = c.disc ? 145 : 110; if (y + need > H - 60) { doc.addPage(); y = 56; }
   const bx = 340, rows = [['Subtotal', money2(c.sub)]];
+  if (c.disc) rows.push([discLabel(e), '-' + money2(c.disc)], ['After discount', money2(c.net)]);
   rows.push(e.tax === 'hst' ? [`HST ${HST_RATE}%`, money2(c.tax)] : ['HST', 'Not included']);
   rows.forEach(([k, v]) => { doc.setFontSize(10.5); doc.setTextColor(...MUT); doc.text(k, bx, y); doc.setTextColor(...INK); doc.text(v, W - M, y, {align: 'right'}); y += 17; });
   doc.setFillColor(...G); doc.roundedRect(bx - 10, y - 6, W - M - bx + 10, 30, 4, 4, 'F');
